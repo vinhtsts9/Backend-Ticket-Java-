@@ -1,0 +1,25 @@
+# Maven
+**/target/
+*.log
+*.jar
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS / system files
+.DS_Store
+Thumbs.db
+
+# Grafana / Prometheus / Docker volumes
+environment/grafana-storage/
+environment/data/
+environment/mysqld-exporter/
+environment/redis-sentinel-cluster/environment/
+benchmark/jmeter.log
+
+# JMeter backup/logs
+benchmark/**/*.log
+benchmark/**/backups/
