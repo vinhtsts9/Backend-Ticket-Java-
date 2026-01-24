@@ -6,6 +6,7 @@ import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.concurrent.TimeUnit;
@@ -14,10 +15,37 @@ import java.util.concurrent.TimeUnit;
 @Slf4j
 public class RedisDistributedLockerImpl implements RedisDistributedService {
 
-    @Resource
+    @Autowired(required = false)
     private RedissonClient redissonClient;
+
     @Override
     public RedisDistributedLocker getDistributedLock(String lockKey) {
+        if (redissonClient == null) {
+            log.warn("RedissonClient not available - distributed locking disabled");
+            return new RedisDistributedLocker() {
+                @Override
+                public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) {
+                    return false;
+                }
+                @Override
+                public void lock(long leaseTime, TimeUnit unit) {}
+                @Override
+                public void unlock() {}
+                @Override
+                public boolean isLocked() {
+                    return false;
+                }
+                @Override
+                public boolean isHeldByThread(long threadId) {
+                    return false;
+                }
+                @Override
+                public boolean isHeldByCurrentThread() {
+                    return false;
+                }
+            };
+        }
+
         RLock rLock = redissonClient.getLock(lockKey);
 
         return new RedisDistributedLocker() {

@@ -19,6 +19,7 @@ import com.ticket.ddd.application.service.order.cache.StockOrderCacheService;
 import com.ticket.ddd.domain.model.entity.TicketOrder;
 import com.ticket.ddd.domain.service.OrderDeductionDomainService;
 import com.ticket.ddd.domain.service.TicketOrderDomainService;
+import com.ticket.ddd.infrastructure.cache.redis.RedisCompensatingTransaction;
 
 import jakarta.persistence.LockTimeoutException;
 import jakarta.persistence.PessimisticLockException;
@@ -35,47 +36,94 @@ public class TicketOrderAppServiceImpl implements TicketOrderAppService {
     private OrderDeductionDomainService orderDeductionDomainService;
     @Autowired
     private StockOrderCacheService stockOrderCacheService;
+    @Autowired
+    private RedisCompensatingTransaction redisCompensatingTransaction;
 
+    /**
+     * Decrease stock with transaction boundaries fixed
+     * Flow:
+     * 1. Decrease Redis cache (Lua script - atomic)
+     * 2. Decrease DB with pessimistic lock
+     * 3. Create order
+     * 4. If any step fails, rollback Redis
+     */
     @Override
     @Transactional(rollbackFor = Exception.class)
-    public boolean decreaseStockCAS(Long ticketId,int quantity) {
+    public boolean decreaseStockCAS(Long ticketId, int quantity) {
+        log.info("[FLOW] Start decreaseStockCAS: ticketId={}, quantity={}", ticketId, quantity);
+        
         try {
+            // STEP 1: Try to decrease stock in Redis cache (Lua script - atomic)
+            log.debug("[FLOW] Step 1: Attempting to decrease Redis cache");
             int oldStockAvailable = stockOrderCacheService.decreaseStockCacheByLua(ticketId, quantity);
-            if(oldStockAvailable == 0) {
-                log.info("Case: oldStockAvailable is 0");
-                // if oldStockAvailable = 0 or then StockInventory unavailable -> return to client
+            
+            if (oldStockAvailable == 0) {
+                log.info("[FLOW] Step 1 FAILED: Stock unavailable in Redis cache");
                 return false;
             }
-            boolean isDecreaseStockSuccess = ticketOrderDomainService.decreaseStock(ticketId, quantity);
-            
-            if(isDecreaseStockSuccess) {
-                TicketOrder tickerOrderPlace = new TicketOrder();
-                //
-                int userId = ThreadLocalRandom.current().nextInt(1, 10);
-                tickerOrderPlace.setUserId(userId);
-                tickerOrderPlace.setOrderNumber("OKX-SGN-"+userId+"-" + System.currentTimeMillis()); //  System.currentTimeMillis() -> always -> 03 month
-                tickerOrderPlace.setTotalAmount(new BigDecimal(quantity * 5000));
-                tickerOrderPlace.setTerminalId("OKX-SGN");
-                tickerOrderPlace.setOrderNotes("Orrder -> Pending");
-                // Now how to find out which table is currently? -> 202503
-//                String nTable = "202504";
-                String nTable = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMM"));
+            log.info("[FLOW] Step 1 SUCCESS: Redis cache decreased, oldStock={}", oldStockAvailable);
 
-                log.info("currently nTbale----> | {}", nTable);
-                orderDeductionDomainService.insertOrder(nTable, tickerOrderPlace);
+            // STEP 2: Decrease stock in database with pessimistic lock
+            log.debug("[FLOW] Step 2: Attempting to decrease DB with pessimistic lock");
+            boolean isDecreaseStockSuccess = ticketOrderDomainService.decreaseStockWithPessimisticLock(ticketId, quantity);
+            
+            if (!isDecreaseStockSuccess) {
+                log.warn("[FLOW] Step 2 FAILED: DB decrease failed, rolling back Redis");
+                // Compensating transaction: restore Redis cache
+                redisCompensatingTransaction.increaseStockCache(ticketId, quantity);
+                redisCompensatingTransaction.logCompensation(ticketId, "decreaseStockCAS", 
+                    "DB pessimistic lock failed");
+                return false;
             }
+            log.info("[FLOW] Step 2 SUCCESS: DB stock decreased with pessimistic lock");
+
+            // STEP 3: Create order within transaction
+            log.debug("[FLOW] Step 3: Creating order");
+            TicketOrder tickerOrderPlace = new TicketOrder();
+            int userId = ThreadLocalRandom.current().nextInt(1, 10);
+            tickerOrderPlace.setUserId(userId);
+            tickerOrderPlace.setOrderNumber("OKX-SGN-" + userId + "-" + System.currentTimeMillis());
+            tickerOrderPlace.setTotalAmount(new BigDecimal(quantity * 5000));
+            tickerOrderPlace.setTerminalId("OKX-SGN");
+            tickerOrderPlace.setOrderNotes("Order -> Pending");
+            String nTable = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMM"));
+
+            orderDeductionDomainService.insertOrder(nTable, tickerOrderPlace);
+            log.info("[FLOW] Step 3 SUCCESS: Order created, orderId={}, table={}", 
+                tickerOrderPlace.getId(), nTable);
+
+            log.info("[FLOW] COMPLETED: decreaseStockCAS successful for ticketId={}", ticketId);
             return true;
+            
         } catch (PessimisticLockException e) {
-            log.warn("Pessimistic Locking failed for ticketId={}", ticketId);
+            log.warn("[FLOW] FAILED: Pessimistic lock timeout for ticketId={}, rolling back Redis", ticketId, e);
+            redisCompensatingTransaction.increaseStockCache(ticketId, quantity);
+            redisCompensatingTransaction.logCompensation(ticketId, "decreaseStockCAS", 
+                "Pessimistic lock timeout: " + e.getMessage());
             return false;
+            
         } catch (LockTimeoutException e) {
-            log.error("Lock timeout while processing ticketId={}", ticketId, e);
+            log.error("[FLOW] FAILED: Lock timeout for ticketId={}, rolling back Redis", ticketId, e);
+            redisCompensatingTransaction.increaseStockCache(ticketId, quantity);
+            redisCompensatingTransaction.logCompensation(ticketId, "decreaseStockCAS", 
+                "Lock timeout: " + e.getMessage());
             return false;
+            
         } catch (Exception e) {
-            log.error("Unexpected error when decreasing stock for ticketId={}", ticketId, e);
+            log.error("[FLOW] FAILED: Unexpected error for ticketId={}, rolling back Redis", ticketId, e);
+            // Try to restore Redis on any exception
+            try {
+                redisCompensatingTransaction.increaseStockCache(ticketId, quantity);
+                redisCompensatingTransaction.logCompensation(ticketId, "decreaseStockCAS", 
+                    "Exception: " + e.getClass().getSimpleName() + " - " + e.getMessage());
+            } catch (Exception compensationError) {
+                log.error("[FLOW] CRITICAL: Failed to compensate Redis rollback for ticketId={}", 
+                    ticketId, compensationError);
+            }
             return false;
         }
     }
+
     @Override
     public int getStockAvailable(Long ticketId) {
         return ticketOrderDomainService.getStockAvailable(ticketId);
@@ -89,10 +137,10 @@ public class TicketOrderAppServiceImpl implements TicketOrderAppService {
                 (String) row[2],
                 (BigDecimal) row[3],
                 (String) row[4],
-                ((Timestamp) row[5]).toLocalDateTime(), // Chuyển Timestamp sang LocalDateTime
+                ((Timestamp) row[5]).toLocalDateTime(),
                 (String) row[6],
-                ((Timestamp) row[7]).toLocalDateTime(), // Chuyển Timestamp sang LocalDateTime
-                ((Timestamp) row[8]).toLocalDateTime()  // Chuyển Timestamp sang LocalDateTime
+                ((Timestamp) row[7]).toLocalDateTime(),
+                ((Timestamp) row[8]).toLocalDateTime()
         )).toList();
     }
     @Override
@@ -106,43 +154,36 @@ public class TicketOrderAppServiceImpl implements TicketOrderAppService {
         String nTable = extractYearMonthFromOrderNumber(orderNumber);
         log.info("nTable: findByOrderNumber ={}", nTable);
         Object[] row = orderDeductionDomainService.findByOrderNumber(nTable, orderNumber);
-//        return orderDeductionDomainService.findByOrderNumber(yearMonth, orderNumber);
         if(row == null){
             return null;
-//            throw new EntityNotFoundException("Order not found: " + orderNumber);
         }
-        return new TicketOrderDTO( // toMapStruct()
-                ((Number) row[0]).intValue(),  // id
-                ((Number) row[1]).intValue(),  // userId
-                (String) row[2],               // orderNumber
-                (BigDecimal) row[3],           // totalAmount
-                (String) row[4],               // terminalId
-                ((Timestamp) row[5]).toLocalDateTime(), // orderDate
-                (String) row[6],               // orderNotes
-                ((Timestamp) row[7]).toLocalDateTime(), // updatedAt
-                ((Timestamp) row[8]).toLocalDateTime()  // createdAt
+        return new TicketOrderDTO(
+                ((Number) row[0]).intValue(),
+                ((Number) row[1]).intValue(),
+                (String) row[2],
+                (BigDecimal) row[3],
+                (String) row[4],
+                ((Timestamp) row[5]).toLocalDateTime(),
+                (String) row[6],
+                ((Timestamp) row[7]).toLocalDateTime(),
+                ((Timestamp) row[8]).toLocalDateTime()
         );
     }
-    // chuyển đổi
+
     private String extractYearMonthFromOrderNumber(String orderNumber) {
         try {
-            // Lấy timestamp từ orderNumber
             String[] parts = orderNumber.split("-");
             if (parts.length < 2) {
                 throw new IllegalArgumentException("Invalid order number format");
             }
             long timestamp = Long.parseLong(parts[parts.length - 1]);
-
-            // Chuyển đổi timestamp thành LocalDateTime
             LocalDateTime dateTime = Instant.ofEpochMilli(timestamp)
                     .atZone(ZoneId.systemDefault())
                     .toLocalDateTime();
-
-            // Format thành yyyyMM
             return dateTime.format(DateTimeFormatter.ofPattern("yyyyMM"));
         } catch (Exception e) {
             throw new RuntimeException("Failed to extract yearMonth from orderNumber: " + orderNumber, e);
         }
     }
-
 }
+

@@ -2,10 +2,12 @@ server:
   port: 1122
   tomcat:
     threads:
-      max: 200 #
-      min-spare: 50
-    #    max-connections: 8000
-    accept-count: 20000
+      max: 500 # Increased from 200 for high concurrency
+      min-spare: 100 # Increased from 50
+    max-connections: 8000 # Uncommented
+    accept-count: 5000 # Reduced from 20000 for faster rejection
+    connection-timeout: 30000
+    max-http-post-size: 2MB
 
 
 spring:
@@ -15,8 +17,12 @@ spring:
   #DBS
   datasource:
     hikari:
-      maximum-pool-size: 20  # Số lượng tối đa kết nối
-      minimum-idle: 5        # Số lượng kết nối tối thiểu trong pool
+      maximum-pool-size: 50 # Increased from 20
+      minimum-idle: 10 # Increased from 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      leak-detection-threshold: 60000 # Detect connection leaks
     url: jdbc:mysql://localhost:3316/vetautet
     username: root
     password: 123456

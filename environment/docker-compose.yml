@@ -3,30 +3,29 @@ version: '3.2'
 networks:
   pre-event-network:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.31.0.0/16
 
 services:
   ticket-service:
     build:
       context: ..
       dockerfile: environment/Dockerfile
-    volumes:
-      - ../Ticket-start/target/Ticket-start-1.0-SNAPSHOT.jar:/app/app.jar
     working_dir: /app
     ports:
       - "1122:1122"
     environment:
       - SERVER_PORT=1122
-      - SPRING_DATASOURCE_URL=jdbc:mysql://host.docker.internal:3316/vetautet
+      - SPRING_DATASOURCE_URL=jdbc:mysql://mysql:3306/vetautet
       - SPRING_DATASOURCE_USERNAME=root
       - SPRING_DATASOURCE_PASSWORD=123456
-      - SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE=20
-      - SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE=5
+      - SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE=50
+      - SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE=10
       - SPRING_REDIS_SENTINEL_MASTER=mymaster
       - SPRING_REDIS_SENTINEL_NODES=redis-sentinel1:26379,redis-sentinel2:26379,redis-sentinel3:26379
       - SPRING_REDIS_PASSWORD=123456
+    depends_on:
+      - mysql
+      - redis-master
+      - redis-sentinel1
     networks:
       - pre-event-network
 
@@ -39,7 +38,7 @@ services:
     command: [
         '--character-set-server=utf8mb4',
         '--collation-server=utf8mb4_unicode_ci',
-        '--skip-character-set-client-handshake', # Buộc tất cả kết nối sử dụng utf8mb4
+        '--skip-character-set-client-handshake',
     ]
     environment:
       MYSQL_ROOT_PASSWORD: 123456
@@ -51,162 +50,223 @@ services:
     networks:
       - pre-event-network
 
-  #Redis
-  redis:
-    container_name: pre-event-redis
-    image: redis:latest
+  # ===== Redis Sentinel Cluster Setup =====
+  redis-master:
+    image: redis:7.2.4
+    container_name: redis-master
+    command: ["sh", "-c", "redis-server --protected-mode no --requirepass 123456 --bind 0.0.0.0"]
     ports:
-      - "6319:6379"
+      - "6379:6379"
     networks:
       - pre-event-network
 
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: pre-event-prometheus
-    restart: unless-stopped
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./data/prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--web.enable-lifecycle'
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    ports:
-      - "9090:9090"
-    networks:
-      - pre-event-network
-
-  grafana:
-    image: grafana/grafana
-    container_name: pre-event-grafana
-    hostname: grafana
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SING_UP=false
-      - GF_SERVER_DOMAIN=localhost
-      #enable logger
-      - GF_LOG_MODE=console file
-      - GF_LOG_FILTERS=alerting.notifier.slack:debug alermanager:debug ngalert:debug
-
-    volumes:
-      - ./grafana-storage:/var/lib/grafana
-    ports:
-      - "3000:3000"
-    networks:
-      - pre-event-network
-
-  node-exporter:
-    image: prom/node-exporter:latest
-    container_name: pre-event-node-exporter
-    restart: unless-stopped
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - --path.procfs=/host/proc
-      - --path.rootfs=/rootfs
-      - --path.sysfs=/host/sys
-      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
-    ports:
-      - "9100:9100"
-    networks:
-      - pre-event-network
-
-  mysqld-exporter:
-    image: prom/mysqld-exporter
-    container_name: pre-event-mysqld-exporter
-    ports:
-      - "9104:9104"
-    command:
-      - '--collect.engine_innodb_status'
-      - '--collect.info_schema.processlist'
-      - '--collect.info_schema.tables'
-      - '--collect.info_schema.query_response_time'
-      - '--collect.perf_schema.file_events'
-      - '--collect.perf_schema.eventsstatements'
-      - '--collect.perf_schema.indexiowaits'
-      - '--collect.global_status'
-      #      - '--ignore-tables'
-      - '--config.my-cnf=/etc/mysql/.my.cnf'
-    volumes:
-      - ./mysqld-exporter/.my.cnf:/etc/mysql/.my.cnf
-    environment:
-      - DATA_SOURCE_NAME=root:123456@tcp(mysql:3306)/
+  redis-slave1:
+    image: redis:7.2.4
+    container_name: redis-slave1
     depends_on:
-      - mysql
+      - redis-master
+    command: ["sh", "-c", "redis-server --slaveof redis-master 6379 --masterauth 123456 --requirepass 123456 --protected-mode no --bind 0.0.0.0"]
+    ports:
+      - "6380:6379"
     networks:
       - pre-event-network
 
-  redis-exporter:
-    image: oliver006/redis_exporter
-    command: -redis.addr redis://redis:6379
-    ports:
-      - 9121:9121
-    networks:
-      - pre-event-network
-
-  elasticsearch:
-    image: elasticsearch:7.17.25
-    container_name: pre-event-elasticsearch
-    volumes:
-      - ./elk/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
-    ports:
-      - "9200:9200"
-      - "9300:9300"
-    environment:
-      ES_JAVA_OPTS: "-Xmx256m -Xms256m"
-      discovery.type: single-node
-    networks:
-      - pre-event-network
-
-  logstash:
-    image: logstash:7.17.25
-    container_name: pre-event-logstash
-    volumes:
-      - ./elk/logstash.yml:/usr/share/logstash/config/logstash.yml
-      - ./elk/pipeline:/usr/share/logstash/pipeline
-    ports:
-      - "5044:5044"
-      - "5033:5000/tcp"
-      - "5022:5000/udp"
-      - "9600:9600"
-    environment:
-      LS_JAVA_OPTS: "-Xmx256m -Xms256m"
-    networks:
-      - pre-event-network
+  redis-slave2:
+    image: redis:7.2.4
+    container_name: redis-slave2
     depends_on:
-      - elasticsearch
-
-  kibana:
-    image: kibana:7.17.25
-    container_name: pre-event-kibana
-    volumes:
-      - ./elk/kibana.yml:/usr/share/kibana/config/kibana.yml
+      - redis-master
+    command: ["sh", "-c", "redis-server --slaveof redis-master 6379 --masterauth 123456 --requirepass 123456 --protected-mode no --bind 0.0.0.0"]
     ports:
-      - "5601:5601"
+      - "6381:6379"
     networks:
       - pre-event-network
-    depends_on:
-      - elasticsearch
 
-#  logstash-exporter:
-#    image: alxrem/prometheus-logstash-exporter
-#    container_name: pre-event-logstash-exporter
-#    command: ["-logstash.host", "logstash"]
-#    platform: linux/arm64/v8
-#    environment:
-#      LOGSTASH_URI: "http://logstash:9600" # Kết nối tới Logstash API
-#    ports:
-#      - "9304:9304" # Cổng Logstash Exporter cho Prometheus
-#    networks:
-#      - pre-event-network
-#    depends_on:
-#      - logstash
+  redis-sentinel1:
+    image: redis:7.2.4
+    container_name: redis-sentinel1
+    depends_on:
+      - redis-master
+    volumes:
+      - ./sentinel1/sentinel.conf:/tmp/sentinel.conf
+      - sentinel1-data:/data
+    ports:
+      - "26379:26379"
+    command: sh -c "cp /tmp/sentinel.conf /data/sentinel.conf && redis-sentinel /data/sentinel.conf --dir /data --sentinel deny-scripts-reconfig yes"
+    networks:
+      - pre-event-network
+
+  redis-sentinel2:
+    image: redis:7.2.4
+    container_name: redis-sentinel2
+    depends_on:
+      - redis-master
+    volumes:
+      - ./sentinel2/sentinel.conf:/tmp/sentinel.conf
+      - sentinel2-data:/data
+    ports:
+      - "26380:26379"
+    command: sh -c "cp /tmp/sentinel.conf /data/sentinel.conf && redis-sentinel /data/sentinel.conf --dir /data --sentinel deny-scripts-reconfig yes"
+    networks:
+      - pre-event-network
+
+  redis-sentinel3:
+    image: redis:7.2.4
+    container_name: redis-sentinel3
+    depends_on:
+      - redis-master
+    volumes:
+      - ./sentinel3/sentinel.conf:/tmp/sentinel.conf
+      - sentinel3-data:/data
+    ports:
+      - "26381:26379"
+    command: sh -c "cp /tmp/sentinel.conf /data/sentinel.conf && redis-sentinel /data/sentinel.conf --dir /data --sentinel deny-scripts-reconfig yes"
+    networks:
+      - pre-event-network
+
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: pre-event-prometheus
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+  #     - ./data/prometheus_data:/prometheus
+  #   command:
+  #     - '--config.file=/etc/prometheus/prometheus.yml'
+  #     - '--storage.tsdb.path=/prometheus'
+  #     - '--web.console.libraries=/etc/prometheus/console_libraries'
+  #     - '--web.console.templates=/etc/prometheus/consoles'
+  #     - '--web.enable-lifecycle'
+  #   extra_hosts:
+  #     - host.docker.internal:host-gateway
+  #   ports:
+  #     - "9090:9090"
+  #   networks:
+  #     pre-event-network:
+  #       ipv4_address: 172.31.0.50
+
+  # grafana:
+  #   image: grafana/grafana
+  #   container_name: pre-event-grafana
+  #   hostname: grafana
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #     - GF_USERS_ALLOW_SING_UP=false
+  #     - GF_SERVER_DOMAIN=localhost
+  #     - GF_LOG_MODE=console file
+  #     - GF_LOG_FILTERS=alerting.notifier.slack:debug alermanager:debug ngalert:debug
+  #   volumes:
+  #     - ./grafana-storage:/var/lib/grafana
+  #   ports:
+  #     - "3000:3000"
+  #   networks:
+  #     pre-event-network:
+  #       ipv4_address: 172.31.0.51
+
+  # node-exporter:
+  #   image: prom/node-exporter:latest
+  #   container_name: pre-event-node-exporter
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /proc:/host/proc:ro
+  #     - /sys:/host/sys:ro
+  #     - /:/rootfs:ro
+  #   command:
+  #     - --path.procfs=/host/proc
+  #     - --path.rootfs=/rootfs
+  #     - --path.sysfs=/host/sys
+  #     - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+  #   ports:
+  #     - "9100:9100"
+  #   networks:
+  #     pre-event-network:
+  #       ipv4_address: 172.31.0.52
+
+  # mysqld-exporter:
+  #   image: prom/mysqld-exporter
+  #   container_name: pre-event-mysqld-exporter
+  #   ports:
+  #     - "9104:9104"
+  #   command:
+  #     - '--collect.engine_innodb_status'
+  #     - '--collect.info_schema.processlist'
+  #     - '--collect.info_schema.tables'
+  #     - '--collect.info_schema.query_response_time'
+  #     - '--collect.perf_schema.file_events'
+  #     - '--collect.perf_schema.eventsstatements'
+  #     - '--collect.perf_schema.indexiowaits'
+  #     - '--collect.global_status'
+  #     - '--config.my-cnf=/etc/mysql/.my.cnf'
+  #   volumes:
+  #     - ./mysqld-exporter/.my.cnf:/etc/mysql/.my.cnf
+  #   environment:
+  #     - DATA_SOURCE_NAME=root:123456@tcp(mysql:3306)/
+  #   depends_on:
+  #     - mysql
+  #   networks:
+  #     pre-event-network:
+  #       ipv4_address: 172.31.0.53
+
+  # redis-exporter:
+  #   image: oliver006/redis_exporter
+  #   command: -redis.addr redis://redis-master:6379 -redis.password 123456
+  #   ports:
+  #     - 9121:9121
+  #   depends_on:
+  #     - redis-master
+  #   networks:
+  #     pre-event-network:
+  #       ipv4_address: 172.31.0.54
+
+  # elasticsearch:
+  #   image: elasticsearch:7.17.25
+  #   container_name: pre-event-elasticsearch
+  #   volumes:
+  #     - ./elk/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+  #   ports:
+  #     - "9200:9200"
+  #     - "9300:9300"
+  #   environment:
+  #     ES_JAVA_OPTS: "-Xmx256m -Xms256m"
+  #     discovery.type: single-node
+  #   networks:
+  #     pre-event-network:
+  #       ipv4_address: 172.31.0.60
+
+  # logstash:
+  #   image: logstash:7.17.25
+  #   container_name: pre-event-logstash
+  #   volumes:
+  #     - ./elk/logstash.yml:/usr/share/logstash/config/logstash.yml
+  #     - ./elk/pipeline:/usr/share/logstash/pipeline
+  #   ports:
+  #     - "5044:5044"
+  #     - "5033:5000/tcp"
+  #     - "5022:5000/udp"
+  #     - "9600:9600"
+  #   environment:
+  #     LS_JAVA_OPTS: "-Xmx256m -Xms256m"
+  #   networks:
+  #     pre-event-network:
+  #       ipv4_address: 172.31.0.61
+  #   depends_on:
+  #     - elasticsearch
+
+  # kibana:
+  #   image: kibana:7.17.25
+  #   container_name: pre-event-kibana
+  #   volumes:
+  #     - ./elk/kibana.yml:/usr/share/kibana/config/kibana.yml
+  #   ports:
+  #     - "5601:5601"
+  #   networks:
+  #     pre-event-network:
+  #       ipv4_address: 172.31.0.62
+  #   depends_on:
+  #     - elasticsearch
 
 volumes:
   mysql_data3:
+  sentinel1-data:
+  sentinel2-data:
+  sentinel3-data:

@@ -20,6 +20,10 @@ public class TicketOrderDomainServiceImpl implements TicketOrderDomainService {
         return ticketOrderRepo.decreaseStock(ticketId,quantity);
     }
     @Override
+    public boolean decreaseStockWithPessimisticLock(Long ticketId, int quantity) {
+        return ticketOrderRepo.decreaseStockWithPessimisticLock(ticketId, quantity);
+    }
+    @Override
     public int getStockAvailable(Long ticketId) {
         return ticketOrderRepo.getStockAvailable(ticketId);
     }
